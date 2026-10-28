@@ -20,7 +20,6 @@ TRON_WALLET, EVM_WALLET = os.getenv("TRON_WALLET", ""), os.getenv("EVM_WALLET", 
 TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
 ACTIVE = ("Pending", "Processing", "In progress")
 
-# USDT on each chain. Add more chains here (same fields) and they appear in the bot automatically.
 CHAINS = {
     "trc20": dict(name="USDT TRC20 (Tron)", kind="tron", wallet=TRON_WALLET, dec=6,
                   contract="TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"),
@@ -37,9 +36,9 @@ CHAINS = {
 ON = {k: c for k, c in CHAINS.items() if c["wallet"]}
 POS = {}
 
-# Everything is in INR. provider_mult converts the provider's rate into INR (1 if provider is in INR, 90 if in USD).
+# Everything is INR. provider_mult converts provider rate to INR (1 if provider bills in INR, 90 if in USD).
 DEFAULTS = {"usdt_inr": "90", "ref_percent": "1", "upi_id": "yourupi@bank", "min_deposit": "50", "provider_mult": "1"}
-SEED = {  # starting platforms/sections, all editable from the admin panel
+SEED = {
     "Telegram": ["Members", "Post Views", "Reactions", "Refer"],
     "YouTube": ["Subscribers", "Views", "Likes", "Watch Time"],
     "Instagram": ["Followers", "Likes", "Views", "Comments"],
@@ -70,16 +69,14 @@ ALTER TABLE sections ENABLE ROW LEVEL SECURITY;
 ALTER TABLE services ENABLE ROW LEVEL SECURITY;
 """
 TBL = {"p": "platforms", "s": "sections", "v": "services"}
-BACKTO = {"p": "p", "s": "s", "v": "sv"}
-PER = 8  # services per page for users
 
 bot = Bot(TOKEN)
 db: asyncpg.Pool = None
 HTTP: aiohttp.ClientSession = None
-SET = dict(DEFAULTS)    # settings cache (no DB hit per click)
-CAT = {}                # catalog cache (no DB hit per click)
-PS = {"t": 0, "d": {}}  # provider services cache (admin only)
-BANNED = set()          # banned users cache (no DB hit per message)
+SET = dict(DEFAULTS)    # settings cache
+CAT = {}                # catalog cache
+PS = {"t": 0, "d": {}}  # provider services cache
+BANNED = set()          # banned user ids cache
 
 
 # ======================= helpers =======================
@@ -87,38 +84,29 @@ def gs(k): return SET[k]
 def money(x): return f"₹{D(x):,.2f}"
 def B(t, c): return IB(text=t, callback_data=c)
 def BACK(c): return [B("🔙 Back", c)]
-def grid(btns, n): return [btns[i:i + n] for i in range(0, len(btns), n)]
 
 def num(t):
     try:
         v = D(t.strip())
-        return v if v.is_finite() and v > 0 else None
+        return v if v > 0 else None
     except Exception:
         return None
-
-def valid_setting(k, v):
-    if k == "upi_id": return bool(v)
-    try:
-        d = D(v)
-    except Exception:
-        return False
-    return d.is_finite() and (d >= 0 if k == "ref_percent" else d > 0)
 
 def price_of(v, qty):
     return max((v["rate"] * qty / 1000).quantize(D("0.01")), D("0.01"))
 
 def parse_price(t, cost):
-    """'25' or '25%' = commission on provider cost, '₹40' or '=40' = fixed price per 1000."""
+    """'25' or '25%' = commission on provider cost; '₹40' or '=40' = fixed price per 1000."""
     t = t.strip().replace(",", "")
     try:
         if t[:1] in ("₹", "="):
             v = D(t[1:])
-            return v.quantize(D("0.01")) if v.is_finite() and v > 0 else None
+            return v.quantize(D("0.01")) if v > 0 else None
         v = D(t.rstrip("%"))
-        if not v.is_finite() or v < 0 or not cost: return None
-        return (cost * (1 + v / 100)).quantize(D("0.01"))
     except Exception:
         return None
+    if v < 0 or not cost: return None
+    return (cost * (1 + v / 100)).quantize(D("0.01"))
 
 async def tell(uid, text, **kw):
     try:
@@ -140,7 +128,7 @@ async def load_settings():
 
 async def load_banned():
     BANNED.clear()
-    BANNED.update(row["id"] for row in await db.fetch("SELECT id FROM users WHERE banned"))
+    BANNED.update(r["id"] for r in await db.fetch("SELECT id FROM users WHERE banned"))
 
 async def seed():
     if await db.fetchval("SELECT 1 FROM settings WHERE k='seeded'"): return
@@ -150,12 +138,6 @@ async def seed():
             await db.execute("INSERT INTO sections(platform_id,name,pos) VALUES($1,$2,$3)", pid, s, j)
     await db.execute("INSERT INTO settings VALUES('seeded','1') ON CONFLICT DO NOTHING")
 
-async def wipe_once():
-    """One-time clean start: removes all services (platforms and sections stay)."""
-    if await db.fetchval("SELECT 1 FROM settings WHERE k='services_reset_v1'"): return
-    await db.execute("DELETE FROM services")
-    await db.execute("INSERT INTO settings VALUES('services_reset_v1','1') ON CONFLICT DO NOTHING")
-
 async def load_catalog():
     P = await db.fetch("SELECT * FROM platforms WHERE active ORDER BY pos,id")
     Sx = await db.fetch("SELECT * FROM sections WHERE active ORDER BY pos,id")
@@ -164,7 +146,7 @@ async def load_catalog():
     for v in V: svc_by_sec.setdefault(v["section_id"], []).append(v)
     sec_by_plat, sec_by_id = {}, {}
     for s in Sx:
-        if s["id"] in svc_by_sec:  # empty sections stay hidden from users
+        if s["id"] in svc_by_sec:  # empty sections hidden from users
             sec_by_plat.setdefault(s["platform_id"], []).append(s)
             sec_by_id[s["id"]] = s
     plat = [p for p in P if p["id"] in sec_by_plat]
@@ -172,16 +154,15 @@ async def load_catalog():
                svc_by_sec=svc_by_sec, svc_by_id={v["id"]: v for v in V})
 
 
-# ======================= provider API (adapt here if your provider's format differs) =======================
+# ======================= provider API =======================
 async def api(**p):
     p["key"] = P_KEY
-    async with HTTP.post(P_URL, data=p, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-        return await resp.json(content_type=None)
+    async with HTTP.post(P_URL, data=p, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        return await r.json(content_type=None)
 
 async def pservices():
     if time.time() - PS["t"] > 300 or not PS["d"]:
         data = await api(action="services")
-        if not isinstance(data, list): raise RuntimeError(str(data)[:150])
         PS["d"] = {int(s["service"]): s for s in data}
         PS["t"] = time.time()
     return PS["d"]
@@ -189,9 +170,7 @@ async def pservices():
 def pcost(ps):
     return D(str(ps["rate"])) * D(gs("provider_mult"))
 
-
 async def credit_deposit(dep_id, txid=None):
-    """Atomic + idempotent: credits user, pays referral bonus."""
     async with db.acquire() as c, c.transaction():
         d = await c.fetchrow("UPDATE deposits SET status='done', txid=COALESCE($2,txid) WHERE id=$1 AND status='pending' "
                              "RETURNING user_id, COALESCE(credit, amount) AS amt", dep_id, txid)
@@ -211,10 +190,10 @@ async def credit_deposit(dep_id, txid=None):
 class S(StatesGroup):
     link = State(); qty = State(); usdt = State(); upi_amt = State(); upi_proof = State()
 
-class AS(StatesGroup):   # add service (admin)
+class AS(StatesGroup):   # add service
     pid = State(); comm = State(); pick = State(); name = State(); desc = State()
 
-class E(StatesGroup):    # edits (admin)
+class E(StatesGroup):    # edits
     rename = State(); newplat = State(); newsec = State(); price = State(); desc = State()
 
 MENU_TEXTS = {"🛒 New Order", "💰 Add Funds", "📦 My Orders", "🎁 Referral", "👤 Account", "🆘 Support"}
@@ -235,7 +214,7 @@ adm.message.filter(F.from_user.id.in_(ADMINS))
 adm.callback_query.filter(F.from_user.id.in_(ADMINS))
 
 
-# ======================= ADMIN: views =======================
+# ======================= ADMIN =======================
 async def bail(m: Message, state: FSMContext):
     if m.text in MENU_TEXTS:
         await state.clear()
@@ -246,8 +225,7 @@ async def bail(m: Message, state: FSMContext):
 async def a_home(ev):
     await send(ev, "🛠 Admin Panel", IM(inline_keyboard=[
         [B("➕ Add Service", "a:add"), B("🗂 Platforms & Services", "a:p")],
-        [B("📊 Stats", "a:stats"), B("⚙️ Settings", "a:set")],
-        [B("🧹 Clear all services", "a:wipe")]]))
+        [B("📊 Stats", "a:stats"), B("⚙️ Settings", "a:set")]]))
 
 async def stats_text():
     u = await db.fetchval("SELECT count(*) FROM users")
@@ -276,18 +254,18 @@ async def v_section(ev, sid):
     s = await db.fetchrow("SELECT * FROM sections WHERE id=$1", sid)
     if not s: return await v_platforms(ev)
     vs = await db.fetch("SELECT * FROM services WHERE section_id=$1 ORDER BY pos,id", sid)
-    lines, btns = [], []
-    for n, v in enumerate(vs, 1):
+    lines, kb = [], []
+    for i, v in enumerate(vs, 1):
         ps = PS["d"].get(v["provider_id"])
-        warn = " ⚠️" if ps and v["rate"] < pcost(ps) else ""
-        lines.append(f"{n}. {'✅' if v['active'] else '🙈'} {v['name']} | {money(v['rate'])}{warn}")
-        btns.append(B(str(n), f"a:sv:{v['id']}"))
-    kb = grid(btns, 5)
-    kb += [[B("➕ Add Service", f"a:add:{sid}")],
-           [B("✏️ Rename", f"a:r:s:{sid}"), B("👁 Show/Hide", f"a:t:s:{sid}")],
-           [B("🗑 Delete section", f"a:d:s:{sid}")], BACK(f"a:p:{s['platform_id']}")]
-    body = "\n".join(lines) + "\n\nTap a number to manage." if lines else "No services yet."
-    await send(ev, f"{'✅' if s['active'] else '🙈'} {s['name']}\n\n{body}"[:4000], IM(inline_keyboard=kb))
+        warn = " ⚠️ below cost" if ps and v["rate"] < pcost(ps) else ""
+        lines.append(f"{i}. {'✅' if v['active'] else '🙈'} {v['name']} — {money(v['rate'])}/1k{warn}")
+        kb.append(B(str(i), f"a:sv:{v['id']}"))
+    rows = [kb[i:i + 5] for i in range(0, len(kb), 5)]
+    rows += [[B("➕ Add Service here", f"a:add:{sid}")],
+             [B("✏️ Rename", f"a:r:s:{sid}"), B("👁 Show/Hide", f"a:t:s:{sid}")],
+             [B("🗑 Delete section", f"a:d:s:{sid}")], BACK(f"a:p:{s['platform_id']}")]
+    await send(ev, f"{'✅' if s['active'] else '🙈'} {s['name']}\n\n" + ("\n".join(lines) or "No services yet.") +
+               "\n\nTap a number to manage:", IM(inline_keyboard=rows))
 
 async def v_service(ev, vid):
     v = await db.fetchrow("SELECT * FROM services WHERE id=$1", vid)
@@ -315,8 +293,11 @@ async def after(ev, k, i):
     elif k == "s": await v_section(ev, i)
     else: await v_service(ev, i)
 
+async def pick_platform(ev):
+    rows = await db.fetch("SELECT * FROM platforms ORDER BY pos,id")
+    await send(ev, "Pick a platform for this service:", IM(inline_keyboard=[[B(p["name"], f"k:p:{p['id']}")] for p in rows]))
 
-# ======================= ADMIN: commands =======================
+# ---- admin commands (registered first so they win over state handlers) ----
 @adm.message(Command("admin"))
 async def admin_cmd(m: Message, state: FSMContext):
     await state.clear()
@@ -327,38 +308,31 @@ async def cancel_cmd(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Cancelled.", reply_markup=MENU)
 
+@adm.message(Command("set"))
+async def set_cmd(m: Message, command: CommandObject):
+    a = (command.args or "").split(None, 1)
+    if len(a) != 2 or a[0] not in DEFAULTS or (a[0] != "upi_id" and num(a[1]) is None):
+        return await m.answer("/set <" + "|".join(DEFAULTS) + "> <value>")
+    await db.execute("INSERT INTO settings VALUES($1,$2) ON CONFLICT(k) DO UPDATE SET v=$2", a[0], a[1].strip())
+    SET[a[0]] = a[1].strip()
+    await m.answer("✅ Updated")
+
 @adm.message(Command("user"))
 async def user_info(m: Message, command: CommandObject):
     if not (command.args or "").isdigit(): return await m.answer("/user <id>")
-    uid = int(command.args)
-    u = await db.fetchrow("SELECT * FROM users WHERE id=$1", uid)
-    if not u: return await m.answer("Not found")
-    n = await db.fetchval("SELECT count(*) FROM orders WHERE user_id=$1", uid)
-    await m.answer(f"ID {u['id']}\nBalance {money(u['balance'])}\nOrders: {n}\nBanned: {u['banned']}\nRef by: {u['ref_by']}")
+    u = await db.fetchrow("SELECT * FROM users WHERE id=$1", int(command.args))
+    await m.answer(f"ID {u['id']}\nBalance {money(u['balance'])}\nBanned: {u['banned']}\nRef by: {u['ref_by']}" if u else "Not found")
 
 @adm.message(Command("addbal"))
 async def addbal(m: Message, command: CommandObject):
     a = (command.args or "").split()
     amt = None
-    try:
-        amt = D(a[1])
-        if not amt.is_finite(): amt = None
-    except Exception:
-        pass
-    if len(a) != 2 or not a[0].isdigit() or amt is None: return await m.answer("/addbal <id> <amount in ₹> (negative to deduct)")
+    try: amt = D(a[1])
+    except Exception: pass
+    if len(a) != 2 or not a[0].isdigit() or amt is None: return await m.answer("/addbal <id> <₹> (negative to deduct)")
     ok = await db.fetchval("UPDATE users SET balance=balance+$2 WHERE id=$1 RETURNING 1", int(a[0]), amt)
     if ok: await tell(int(a[0]), f"💰 Balance adjusted by {money(amt)}")
     await m.answer("✅ Done" if ok else "User not found")
-
-@adm.message(Command("set"))
-async def set_cmd(m: Message, command: CommandObject):
-    a = (command.args or "").split(None, 1)
-    if len(a) != 2 or a[0] not in DEFAULTS or not valid_setting(a[0], a[1].strip()):
-        return await m.answer("/set <" + "|".join(DEFAULTS) + "> <value>")
-    v = a[1].strip()
-    await db.execute("INSERT INTO settings VALUES($1,$2) ON CONFLICT(k) DO UPDATE SET v=$2", a[0], v)
-    SET[a[0]] = v
-    await m.answer("✅ Updated")
 
 @adm.message(Command("ban", "unban"))
 async def ban(m: Message, command: CommandObject):
@@ -387,16 +361,17 @@ async def provider_bal(m: Message):
         b = await api(action="balance")
         await m.answer(f"Provider balance: {b.get('balance')} {b.get('currency', '')}")
     except Exception as e:
-        await m.answer(f"Error: {str(e)[:150]}")
+        await m.answer(f"Error: {e}")
 
+@adm.message(Command("resetservices"))
+async def reset_services(m: Message, command: CommandObject):
+    if (command.args or "").strip() != "yes":
+        return await m.answer("This deletes ALL services (platforms & sections stay).\nSend: /resetservices yes")
+    await db.execute("DELETE FROM services")
+    await load_catalog()
+    await m.answer("🗑 All services deleted. Add new ones from /admin → ➕ Add Service.")
 
-# ======================= ADMIN: panel buttons =======================
-async def ask(cb: CallbackQuery, state: FSMContext, st, text, **data):
-    await state.set_state(st)
-    await state.update_data(**data)
-    await cb.message.answer(text + "\n(/cancel to stop)")
-    await cb.answer()
-
+# ---- admin panel callbacks ----
 @adm.callback_query(F.data.startswith("a:"))
 async def a_cb(cb: CallbackQuery, state: FSMContext):
     p = cb.data.split(":")
@@ -409,16 +384,17 @@ async def a_cb(cb: CallbackQuery, state: FSMContext):
     if act == "stats": return await send(cb, await stats_text(), IM(inline_keyboard=[BACK("a:home")]))
     if act == "set":
         cur = "\n".join(f"{k} = {gs(k)}" for k in DEFAULTS)
-        return await send(cb, "⚙️ Settings\n" + cur + "\n\nChange: /set <key> <value>\nOther commands:\n/addbal id ₹  /user id\n"
-                          "/ban id  /unban id\n/broadcast text\n/providerbal", IM(inline_keyboard=[BACK("a:home")]))
+        return await send(cb, "⚙️ Settings\n" + cur + "\n\nChange: /set <key> <value>\n\nOther commands:\n/addbal id ₹\n/user id\n"
+                          "/ban id  /unban id\n/broadcast text\n/providerbal\n/resetservices", IM(inline_keyboard=[BACK("a:home")]))
     if act == "t":
         await db.execute(f"UPDATE {TBL[x[0]]} SET active = NOT active WHERE id=$1", int(x[1]))
         await load_catalog()
         return await after(cb, x[0], int(x[1]))
     if act == "d":
         k, i = x[0], int(x[1])
+        back = {"p": "p", "s": "s", "v": "sv"}[k]
         return await send(cb, "⚠️ Delete this? Everything inside it is deleted too.",
-                          IM(inline_keyboard=[[B("✅ Yes, delete", f"a:dd:{k}:{i}"), B("❌ No", f"a:{BACKTO[k]}:{i}")]]))
+                          IM(inline_keyboard=[[B("✅ Yes, delete", f"a:dd:{k}:{i}"), B("❌ No", f"a:{back}:{i}")]]))
     if act == "dd":
         k, i = x[0], int(x[1])
         parent = None
@@ -426,35 +402,45 @@ async def a_cb(cb: CallbackQuery, state: FSMContext):
         if k == "v": parent = await db.fetchval("SELECT section_id FROM services WHERE id=$1", i)
         await db.execute(f"DELETE FROM {TBL[k]} WHERE id=$1", i)
         await load_catalog()
-        if k == "p" or parent is None: return await v_platforms(cb)
+        if k == "p": return await v_platforms(cb)
         return await (v_platform(cb, parent) if k == "s" else v_section(cb, parent))
-    if act == "wipe":
-        return await send(cb, "⚠️ Delete ALL services? Platforms and sections stay.",
-                          IM(inline_keyboard=[[B("✅ Yes, delete all", "a:wipe2"), B("❌ No", "a:home")]]))
-    if act == "wipe2":
-        await db.execute("DELETE FROM services")
-        await load_catalog()
-        return await a_home(cb)
-    if act == "np": return await ask(cb, state, E.newplat, "Send the new platform name:")
-    if act == "ns": return await ask(cb, state, E.newsec, "Send the new section name:", pid=int(x[0]))
-    if act == "r": return await ask(cb, state, E.rename, "Send the new name:", k=x[0], id=int(x[1]))
-    if act == "pr":
-        return await ask(cb, state, E.price, "Send commission % on provider cost (e.g. 25) or a fixed price like ₹40 (per 1000):", vid=int(x[0]))
-    if act == "ds": return await ask(cb, state, E.desc, "Send the new description (send - to clear):", vid=int(x[0]))
+    prompts = {"np": ("Send the new platform name:", E.newplat, {}),
+               "ns": ("Send the new section name:", E.newsec, {"pid": int(x[0])}),
+               "r": ("Send the new name:", E.rename, {"k": x[0], "id": int(x[1])}),
+               "pr": ("Send commission % (e.g. 25) or a fixed price like ₹40 (per 1000):", E.price, {"vid": int(x[0])}),
+               "ds": ("Send the new description (send - to clear):", E.desc, {"vid": int(x[0])})}
+    if act in prompts:
+        text, st, data = prompts[act]
+        await state.set_state(st)
+        await state.update_data(**data)
+        await cb.message.answer(text + "\n(/cancel to stop)")
+        return await cb.answer()
     if act == "add":
         if not await db.fetchval("SELECT 1 FROM sections"):
             return await cb.answer("Create a platform and section first.", show_alert=True)
-        return await ask(cb, state, AS.pid, "Send the provider's service ID:", sec=int(x[0]) if x else None)
+        await state.set_state(AS.pid)
+        await state.update_data(sid=int(x[0]) if x else None)
+        await cb.message.answer("Send the provider's service ID:\n(/cancel to stop)")
+        return await cb.answer()
+
+@adm.callback_query(F.data.startswith("ad:"))
+async def deposit_cb(cb: CallbackQuery):
+    _, act, i = cb.data.split(":")
+    if act == "ok":
+        txt = "✅ Approved" if await credit_deposit(int(i)) else "Already processed"
+    else:
+        uid = await db.fetchval("UPDATE deposits SET status='rejected' WHERE id=$1 AND status='pending' RETURNING user_id", int(i))
+        if uid: await tell(uid, f"❌ Deposit #{i} was rejected. Contact support.")
+        txt = "❌ Rejected" if uid else "Already processed"
+    await cb.message.edit_text(f"{cb.message.text}\n\n{txt}")
     await cb.answer()
 
-
-# ======================= ADMIN: edit flows =======================
+# ---- admin edit inputs ----
 @adm.message(E.newplat, F.text)
 async def e_newplat(m: Message, state: FSMContext):
     if await bail(m, state): return
     await state.clear()
     await db.execute("INSERT INTO platforms(name,pos) VALUES($1,(SELECT coalesce(max(pos),0)+1 FROM platforms))", m.text.strip()[:40])
-    await load_catalog()
     await v_platforms(m)
 
 @adm.message(E.newsec, F.text)
@@ -463,7 +449,6 @@ async def e_newsec(m: Message, state: FSMContext):
     d = await state.get_data()
     await state.clear()
     await db.execute("INSERT INTO sections(platform_id,name,pos) VALUES($1,$2,(SELECT coalesce(max(pos),0)+1 FROM sections))", d["pid"], m.text.strip()[:40])
-    await load_catalog()
     await v_platform(m, d["pid"])
 
 @adm.message(E.rename, F.text)
@@ -489,120 +474,88 @@ async def e_price(m: Message, state: FSMContext):
     if await bail(m, state): return
     d = await state.get_data()
     v = await db.fetchrow("SELECT * FROM services WHERE id=$1", d["vid"])
-    if not v:
-        await state.clear()
-        return await m.answer("Service no longer exists.")
     try:
         ps = (await pservices()).get(v["provider_id"])
-        cost = pcost(ps) if ps else None
     except Exception:
-        cost = None
-    price = parse_price(m.text, cost)
+        ps = None
+    price = parse_price(m.text, pcost(ps) if ps else None)
     if not price:
-        return await m.answer("Invalid. Send a % like 25, or a fixed price like ₹40." + ("" if cost else "\n(Provider cost unavailable, so only fixed ₹ price works.)"))
+        return await m.answer("Invalid. Send a % like 25, or a fixed price like ₹40." + ("" if ps else "\n(Provider cost unavailable, so only fixed ₹ price works.)"))
     await state.clear()
     await db.execute("UPDATE services SET rate=$2 WHERE id=$1", d["vid"], price)
     await load_catalog()
     await v_service(m, d["vid"])
 
-
-# ======================= ADMIN: add service flow =======================
-# service ID -> provider price shown -> commission % -> platform/section -> name -> description
-async def ask_name(m: Message, state: FSMContext):
-    d = await state.get_data()
-    await state.set_state(AS.name)
-    await m.answer(f"Send the name users will see (or - to use the provider's name):\n{d['pname']}")
-
-async def pick_plat(ev):
-    rows = await db.fetch("SELECT * FROM platforms ORDER BY pos,id")
-    kb = grid([B(p["name"], f"ap:p:{p['id']}") for p in rows], 2) + [[B("❌ Cancel", "ap:x")]]
-    await send(ev, "Choose the platform for this service:", IM(inline_keyboard=kb))
-
+# ---- add service flow ----
 @adm.message(AS.pid, F.text)
 async def as_pid(m: Message, state: FSMContext):
     if await bail(m, state): return
-    t = m.text.strip()
-    if not t.isdigit(): return await m.answer("Send the numeric service ID.")
+    if not m.text.strip().isdigit(): return await m.answer("Send the numeric service ID.")
     try:
-        ps = (await pservices()).get(int(t))
+        ps = (await pservices()).get(int(m.text))
     except Exception as e:
         return await m.answer(f"Provider API error: {str(e)[:150]}")
-    if not ps: return await m.answer("ID not found at the provider. Send another ID.")
-    try:
-        cost, mn, mx = pcost(ps), int(ps["min"]), int(ps["max"])
-    except Exception:
-        return await m.answer("Provider data for this service is invalid. Try another ID.")
-    await state.update_data(prov=int(t), cost=str(cost), pname=str(ps["name"])[:80], mn=mn, mx=mx)
+    if not ps: return await m.answer("ID not found at provider. Try another ID.")
+    cost = pcost(ps)
+    await state.update_data(pid=int(m.text), pname=ps["name"], cost=str(cost), mn=int(ps["min"]), mx=int(ps["max"]))
     await state.set_state(AS.comm)
-    await m.answer(f"📌 {ps['name']}\nProvider ID: {t}\nProvider price: {money(cost)} /1000\nMin {mn} | Max {mx}\n\n"
-                   f"Send your commission % (e.g. 25) — or a fixed price like ₹40 per 1000.\n(/cancel to stop)")
+    await m.answer(f"📦 {ps['name']}\n🗂 {ps.get('category', '')}\n💵 Provider cost: {money(cost)} /1000\n📉 Min {ps['min']} | Max {ps['max']}\n\n"
+                   f"Send your commission % (e.g. 25 → {money(cost * D('1.25'))}/1000)\nor a fixed price like ₹40:")
 
 @adm.message(AS.comm, F.text)
 async def as_comm(m: Message, state: FSMContext):
     if await bail(m, state): return
     d = await state.get_data()
-    cost = D(d["cost"])
-    price = parse_price(m.text, cost)
+    price = parse_price(m.text, D(d["cost"]))
     if not price: return await m.answer("Invalid. Send a % like 25, or a fixed price like ₹40.")
-    await state.update_data(rate=str(price))
-    await m.answer(f"💰 Your price: {money(price)} /1000\nProfit: {money(price - cost)} per 1000" + ("\n⚠️ Below provider cost!" if price < cost else ""))
-    if d.get("sec"): return await ask_name(m, state)
+    await state.update_data(price=str(price))
+    if d.get("sid"):
+        await state.set_state(AS.name)
+        return await m.answer(f"✅ Price: {money(price)} /1000\n\nSend the service name users will see\n(send - to keep: {d['pname']})")
     await state.set_state(AS.pick)
-    await pick_plat(m)
+    await m.answer(f"✅ Price: {money(price)} /1000")
+    await pick_platform(m)
 
-@adm.message(AS.pick)
-async def as_pick_text(m: Message, state: FSMContext):
-    if await bail(m, state): return
-    await m.answer("Use the buttons above to choose a platform and section.")
-
-@adm.callback_query(F.data.startswith("ap:"), AS.pick)
+@adm.callback_query(AS.pick, F.data.startswith("k:"))
 async def as_pick(cb: CallbackQuery, state: FSMContext):
     p = cb.data.split(":")
-    if p[1] == "x":
-        await state.clear()
-        await cb.answer()
-        return await cb.message.edit_text("Cancelled.")
-    if p[1] == "b": return await pick_plat(cb)
     if p[1] == "p":
         secs = await db.fetch("SELECT * FROM sections WHERE platform_id=$1 ORDER BY pos,id", int(p[2]))
-        if not secs: return await cb.answer("No sections here. Add a section first.", show_alert=True)
-        kb = grid([B(s["name"], f"ap:s:{s['id']}") for s in secs], 2) + [BACK("ap:b")]
-        return await send(cb, "Choose the section:", IM(inline_keyboard=kb))
+        if not secs: return await cb.answer("This platform has no sections. Add one first.", show_alert=True)
+        kb = [[B(s["name"], f"k:s:{s['id']}")] for s in secs] + [[B("🔙 Back", "k:0")]]
+        return await send(cb, "Pick a section:", IM(inline_keyboard=kb))
     if p[1] == "s":
-        await state.update_data(sec=int(p[2]))
+        await state.update_data(sid=int(p[2]))
+        await state.set_state(AS.name)
+        d = await state.get_data()
         await cb.answer()
-        return await ask_name(cb.message, state)
-    await cb.answer()
+        return await cb.message.answer(f"Send the service name users will see\n(send - to keep: {d['pname']})")
+    await pick_platform(cb)
 
 @adm.message(AS.name, F.text)
 async def as_name(m: Message, state: FSMContext):
     if await bail(m, state): return
     d = await state.get_data()
-    t = m.text.strip()
-    await state.update_data(name=d["pname"] if t == "-" else t[:80])
+    name = d["pname"] if m.text.strip() == "-" else m.text.strip()[:80]
+    await state.update_data(name=name)
     await state.set_state(AS.desc)
-    await m.answer("Send a short description (or - to skip):")
+    await m.answer("Send a description (speed, refill, etc.) or - for none:")
 
 @adm.message(AS.desc, F.text)
 async def as_desc(m: Message, state: FSMContext):
     if await bail(m, state): return
     d = await state.get_data()
-    t = m.text.strip()
-    try:
-        vid = await db.fetchval(
-            "INSERT INTO services(section_id,provider_id,name,descr,rate,min_qty,max_qty,pos) "
-            "VALUES($1,$2,$3,$4,$5,$6,$7,(SELECT coalesce(max(pos),0)+1 FROM services WHERE section_id=$1)) RETURNING id",
-            d["sec"], d["prov"], d["name"], "" if t == "-" else t[:500], D(d["rate"]), d["mn"], d["mx"])
-    except Exception as e:
-        await state.clear()
-        return await m.answer(f"Could not add: {str(e)[:150]}")
     await state.clear()
+    descr = "" if m.text.strip() == "-" else m.text.strip()[:500]
+    vid = await db.fetchval("INSERT INTO services(section_id,provider_id,name,descr,rate,min_qty,max_qty,pos) "
+                            "VALUES($1,$2,$3,$4,$5,$6,$7,(SELECT coalesce(max(pos),0)+1 FROM services)) RETURNING id",
+                            d["sid"], d["pid"], d["name"], descr, D(d["price"]), d["mn"], d["mx"])
     await load_catalog()
     await m.answer("✅ Service added.")
     await v_service(m, vid)
 
 
-# ======================= USER: menu buttons =======================
+# ======================= USER =======================
 @r.message(CommandStart())
 async def start(m: Message, command: CommandObject, state: FSMContext):
     await state.clear()
@@ -615,21 +568,27 @@ async def start(m: Message, command: CommandObject, state: FSMContext):
         await db.execute("INSERT INTO users(id,ref_by) VALUES($1,$2) ON CONFLICT DO NOTHING", uid, ref)
     await m.answer("👋 Welcome! Order SMM services right here.", reply_markup=MENU)
 
+@r.message(Command("id"))
+async def my_id(m: Message):
+    await m.answer(f"Your Telegram ID: {m.from_user.id}")
+
 @r.message(Command("cancel"))
-async def user_cancel(m: Message, state: FSMContext):
+async def u_cancel(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("Cancelled.", reply_markup=MENU)
+
+async def ensure(uid):
+    return await db.fetchrow("INSERT INTO users(id) VALUES($1) ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id RETURNING *", uid)
 
 @r.message(F.text == "👤 Account")
 async def account(m: Message, state: FSMContext):
     await state.clear()
-    u = await db.fetchrow("INSERT INTO users(id) VALUES($1) ON CONFLICT(id) DO UPDATE SET id=EXCLUDED.id RETURNING *", m.from_user.id)
+    u = await ensure(m.from_user.id)
     n = await db.fetchval("SELECT count(*) FROM orders WHERE user_id=$1", u["id"])
     await m.answer(f"👤 ID: {u['id']}\n💰 Balance: {money(u['balance'])}\n📦 Orders: {n}")
 
 @r.message(F.text == "🆘 Support")
-async def support(m: Message, state: FSMContext):
-    await state.clear()
+async def support(m: Message):
     await m.answer(f"Contact: {SUPPORT}")
 
 @r.message(F.text == "🎁 Referral")
@@ -645,99 +604,88 @@ async def my_orders(m: Message, state: FSMContext):
     await state.clear()
     rows = await db.fetch("SELECT * FROM orders WHERE user_id=$1 ORDER BY id DESC LIMIT 10", m.from_user.id)
     if not rows: return await m.answer("No orders yet.")
-    await m.answer("\n\n".join(f"#{o['id']} • {o['service_name'][:40]}\nQty {o['qty']} • {money(o['charge'])} • {o['status']}" for o in rows))
+    await m.answer("\n\n".join(f"#{o['id']} • {o['service_name']}\nQty {o['qty']} • {money(o['charge'])} • {o['status']}" for o in rows))
 
-@r.message(F.text == "💰 Add Funds")
-async def funds(m: Message, state: FSMContext):
-    await state.clear()
-    rows = [[B(f"💎 {c['name']} - Auto", f"f:{k}")] for k, c in ON.items()]
-    rows.append([B("🇮🇳 UPI - Manual", "f:upi")])
-    await m.answer("Choose payment method:", reply_markup=IM(inline_keyboard=rows))
+# ---- ordering: platform → section → service ----
+async def u_platforms(ev):
+    if not CAT.get("plat"): return await send(ev, "No services available right now.")
+    await send(ev, "🛒 Choose a platform:", IM(inline_keyboard=[[B(p["name"], f"u:p:{p['id']}")] for p in CAT["plat"]]))
 
+async def u_sections(ev, pid):
+    p = CAT["plat_by_id"].get(pid)
+    if not p: return await u_platforms(ev)
+    kb = [[B(s["name"], f"u:s:{s['id']}")] for s in CAT["sec_by_plat"][pid]] + [BACK("u:p")]
+    await send(ev, f"📂 {p['name']}\nChoose a category:", IM(inline_keyboard=kb))
 
-# ======================= USER: ordering (platform -> section -> service) =======================
+async def u_services(ev, sid):
+    s = CAT["sec_by_id"].get(sid)
+    if not s: return await u_platforms(ev)
+    vs, p = CAT["svc_by_sec"][sid], CAT["plat_by_id"][s["platform_id"]]
+    lines = [f"{i}. {v['name']}\n    {money(v['rate'])} /1000 • Min {v['min_qty']} • Max {v['max_qty']}" for i, v in enumerate(vs, 1)]
+    nums = [B(str(i), f"v:{v['id']}") for i, v in enumerate(vs, 1)]
+    kb = [nums[i:i + 5] for i in range(0, len(nums), 5)] + [BACK(f"u:p:{p['id']}")]
+    await send(ev, f"📂 {p['name']} › {s['name']}\n\n" + "\n".join(lines) + "\n\n👇 Tap a number to order:", IM(inline_keyboard=kb))
+
 @r.message(F.text == "🛒 New Order")
-@r.callback_query(F.data == "o:h")
-async def order_home(ev, state: FSMContext):
+async def new_order(m: Message, state: FSMContext):
     await state.clear()
-    plat = CAT.get("plat", [])
-    if not plat: return await send(ev, "⚠️ No services available right now.")
-    kb = grid([B(p["name"], f"o:p:{p['id']}") for p in plat], 2)
-    await send(ev, "🛒 Choose a platform:", IM(inline_keyboard=kb))
+    await u_platforms(m)
 
-@r.callback_query(F.data.startswith("o:p:"))
-async def o_platform(cb: CallbackQuery):
-    p = CAT.get("plat_by_id", {}).get(int(cb.data[4:]))
-    if not p: return await cb.answer("Updated, open New Order again", show_alert=True)
-    secs = CAT["sec_by_plat"].get(p["id"], [])
-    kb = grid([B(s["name"], f"o:s:{s['id']}:0") for s in secs], 2) + [BACK("o:h")]
-    await send(cb, f"{p['name']}\nChoose a section:", IM(inline_keyboard=kb))
+@r.callback_query(F.data.startswith("u:"))
+async def u_nav(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    p = cb.data.split(":")
+    if p[1] == "p" and len(p) > 2: return await u_sections(cb, int(p[2]))
+    if p[1] == "s": return await u_services(cb, int(p[2]))
+    await u_platforms(cb)
 
-@r.callback_query(F.data.startswith("o:s:"))
-async def o_section(cb: CallbackQuery):
-    _, _, sid, pg = cb.data.split(":")
-    s = CAT.get("sec_by_id", {}).get(int(sid))
-    if not s: return await cb.answer("Updated, open New Order again", show_alert=True)
-    vs = CAT["svc_by_sec"][s["id"]]
-    pg = max(0, min(int(pg), (len(vs) - 1) // PER))
-    start_i = pg * PER
-    chunk = vs[start_i:start_i + PER]
-    lines = [f"{start_i + n}. {v['name']}\n    {money(v['rate'])} / 1000" for n, v in enumerate(chunk, 1)]
-    kb = grid([B(str(start_i + n), f"o:v:{v['id']}") for n, v in enumerate(chunk, 1)], 4)
-    nav = []
-    if pg > 0: nav.append(B("⬅️", f"o:s:{s['id']}:{pg - 1}"))
-    if start_i + PER < len(vs): nav.append(B("➡️", f"o:s:{s['id']}:{pg + 1}"))
-    if nav: kb.append(nav)
-    kb.append(BACK(f"o:p:{s['platform_id']}"))
-    await send(cb, (f"{s['name']}\n\n" + "\n\n".join(lines) + "\n\nTap a number to select.")[:4000], IM(inline_keyboard=kb))
-
-@r.callback_query(F.data.startswith("o:v:"))
-async def o_service(cb: CallbackQuery, state: FSMContext):
-    v = CAT.get("svc_by_id", {}).get(int(cb.data[4:]))
+@r.callback_query(F.data.startswith("v:"))
+async def pick(cb: CallbackQuery, state: FSMContext):
+    v = CAT["svc_by_id"].get(int(cb.data[2:]))
     if not v: return await cb.answer("Service not available", show_alert=True)
     await state.set_state(S.link)
     await state.update_data(vid=v["id"])
-    await cb.message.answer(f"✅ {v['name']}\n💵 {money(v['rate'])} per 1000\n📉 Min {v['min_qty']} | Max {v['max_qty']}"
-                            + (f"\n\n📝 {v['descr']}" if v["descr"] else "") + "\n\nSend the link:")
-    await cb.answer()
+    desc = f"📝 {v['descr']}\n" if v["descr"] else ""
+    await send(cb, f"✅ {v['name']}\n{desc}💵 {money(v['rate'])} per 1000\n📉 Min {v['min_qty']} | Max {v['max_qty']}\n\n📎 Send the link:",
+               IM(inline_keyboard=[BACK(f"u:s:{v['section_id']}")]))
 
 @r.message(S.link, F.text)
 async def got_link(m: Message, state: FSMContext):
     if len(m.text) < 4: return await m.answer("Send a valid link.")
     await state.update_data(link=m.text.strip())
     await state.set_state(S.qty)
-    await m.answer("Send quantity:")
+    await m.answer("🔢 Send quantity:")
 
 @r.message(S.qty, F.text)
 async def got_qty(m: Message, state: FSMContext):
     d = await state.get_data()
-    v = CAT.get("svc_by_id", {}).get(d.get("vid"))
-    if not v:
+    v = CAT["svc_by_id"].get(d.get("vid"))
+    if not v: 
         await state.clear()
-        return await m.answer("Service not available. Start again from 🛒 New Order.")
+        return await m.answer("Service no longer available. Start again from 🛒 New Order.")
     if not m.text.isdigit(): return await m.answer("Send a number.")
     q = int(m.text)
     if not v["min_qty"] <= q <= v["max_qty"]: return await m.answer(f"Quantity must be {v['min_qty']} - {v['max_qty']}.")
+    price = price_of(v, q)
+    bal = (await ensure(m.from_user.id))["balance"]
     await state.update_data(qty=q)
-    await m.answer(f"🧾 {v['name']}\nQty: {q}\nLink: {d['link']}\nPrice: {money(price_of(v, q))}",
+    await m.answer(f"🧾 {v['name']}\nQty: {q}\nLink: {d['link']}\n\n💵 Price: {money(price)}\n💰 Your balance: {money(bal)}",
                    reply_markup=IM(inline_keyboard=[[B("✅ Confirm", "ok"), B("❌ Cancel", "no")]]))
 
 @r.callback_query(F.data == "no")
 async def cancel(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.edit_text("Cancelled.")
-    await cb.answer()
+    await send(cb, "Cancelled.")
 
 @r.callback_query(F.data == "ok")
 async def confirm(cb: CallbackQuery, state: FSMContext):
     d = await state.get_data()
-    await state.clear()  # cleared first, so a double tap can't place two orders
-    v = CAT.get("svc_by_id", {}).get(d.get("vid"))
+    await state.clear()
+    v = CAT["svc_by_id"].get(d.get("vid"))
     if not v or "qty" not in d: return await cb.answer("Expired, start again", show_alert=True)
-    await cb.answer()
     uid, charge = cb.from_user.id, price_of(v, d["qty"])
     if not await db.fetchval("UPDATE users SET balance=balance-$2 WHERE id=$1 AND balance>=$2 RETURNING 1", uid, charge):
-        return await cb.message.edit_text("❌ Insufficient balance. Use 💰 Add Funds.")
+        return await send(cb, "❌ Insufficient balance. Use 💰 Add Funds.")
     try:
         res = await api(action="add", service=v["provider_id"], link=d["link"], quantity=d["qty"])
     except Exception as e:
@@ -745,21 +693,27 @@ async def confirm(cb: CallbackQuery, state: FSMContext):
     if isinstance(res, dict) and "order" in res:
         oid = await db.fetchval("INSERT INTO orders(user_id,service_id,service_name,link,qty,charge,provider_order) "
                                 "VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id", uid, v["id"], v["name"], d["link"], d["qty"], charge, str(res["order"]))
-        await cb.message.edit_text(f"✅ Order #{oid} placed. Charged {money(charge)}")
+        await send(cb, f"✅ Order #{oid} placed!\n{v['name']}\nQty {d['qty']} • Charged {money(charge)}")
     else:
         await db.execute("UPDATE users SET balance=balance+$2 WHERE id=$1", uid, charge)
-        err = res.get("error", "Unknown error") if isinstance(res, dict) else "Unknown error"
-        await cb.message.edit_text(f"❌ Order failed, refunded.\n{str(err)[:150]}")
+        err = res.get("error", "Unknown error") if isinstance(res, dict) else "Provider error"
+        await send(cb, f"❌ Order failed, amount refunded.\n{str(err)[:150]}")
 
+# ---- add funds ----
+@r.message(F.text == "💰 Add Funds")
+async def funds(m: Message, state: FSMContext):
+    await state.clear()
+    rows = [[B(f"💎 {c['name']} - Auto", f"f:{k}")] for k, c in ON.items()]
+    rows.append([B("🇮🇳 UPI - Manual", "f:upi")])
+    await m.answer("Choose payment method:", reply_markup=IM(inline_keyboard=rows))
 
-# ======================= USER: add funds =======================
 @r.callback_query(F.data.startswith("f:"))
 async def fund_method(cb: CallbackQuery, state: FSMContext):
     k, mn = cb.data[2:], D(gs("min_deposit"))
     if k in ON:
         await state.set_state(S.usdt)
         await state.update_data(chain=k)
-        await cb.message.answer(f"{ON[k]['name']}\n1 USDT = {money(gs('usdt_inr'))}\nEnter amount in USDT (min {money(mn)} worth):")
+        await cb.message.answer(f"{ON[k]['name']}\nRate: 1 USDT = ₹{gs('usdt_inr')}\nEnter amount in ₹ (min {money(mn)}):")
     elif k == "upi":
         await state.set_state(S.upi_amt)
         await cb.message.answer(f"Enter amount in ₹ (min {money(mn)}):")
@@ -768,31 +722,29 @@ async def fund_method(cb: CallbackQuery, state: FSMContext):
 @r.message(S.usdt, F.text)
 async def usdt_amt(m: Message, state: FSMContext):
     k = (await state.get_data()).get("chain")
+    inr = num(m.text)
     if k not in ON:
         await state.clear()
         return await m.answer("Start again from 💰 Add Funds.")
-    rate = D(gs("usdt_inr"))
-    base = num(m.text)
-    if base: base = base.quantize(D("0.01"))
-    if not base or base * rate < D(gs("min_deposit")): return await m.answer(f"Invalid amount. Minimum is {money(gs('min_deposit'))} worth of USDT.")
-    for _ in range(50):  # unique decimals so we can match the payment
+    if not inr or inr < D(gs("min_deposit")): return await m.answer("Invalid amount.")
+    inr = inr.quantize(D("0.01"))
+    base = (inr / D(gs("usdt_inr"))).quantize(D("0.01"))
+    for _ in range(50):  # unique decimals so the payment can be matched
         amt = base + D(random.randint(1, 99)) / 1000
         if not await db.fetchval("SELECT 1 FROM deposits WHERE method=$1 AND status='pending' AND amount=$2", k, amt): break
-    credit = (amt * rate).quantize(D("0.01"))
-    dep = await db.fetchval("INSERT INTO deposits(user_id,method,amount,credit) VALUES($1,$2,$3,$4) RETURNING id",
-                            m.from_user.id, k, amt, credit)
+    dep = await db.fetchval("INSERT INTO deposits(user_id,method,amount,credit) VALUES($1,$2,$3,$4) RETURNING id", m.from_user.id, k, amt, inr)
     await state.clear()
     c = ON[k]
     await m.answer(f"💎 Deposit #{dep}\nNetwork: {c['name']}\nSend EXACTLY <code>{amt}</code> USDT to:\n<code>{c['wallet']}</code>\n\n"
-                   f"You will receive: {money(credit)}\n⏱ Valid 30 min. Balance is added automatically after confirmation.\n"
+                   f"You will receive {money(inr)}.\n⏱ Valid 30 min. Balance is added automatically after confirmation.\n"
                    f"⚠️ Use ONLY this network and the exact amount, otherwise funds can be lost.", parse_mode="HTML")
 
 @r.message(S.upi_amt, F.text)
 async def upi_amt(m: Message, state: FSMContext):
     inr = num(m.text)
-    if inr: inr = inr.quantize(D("0.01"))
-    if not inr or inr < D(gs("min_deposit")): return await m.answer(f"Invalid amount. Minimum is {money(gs('min_deposit'))}.")
-    dep = await db.fetchval("INSERT INTO deposits(user_id,method,amount) VALUES($1,'upi',$2) RETURNING id", m.from_user.id, inr)
+    if not inr or inr < D(gs("min_deposit")): return await m.answer("Invalid amount.")
+    inr = inr.quantize(D("0.01"))
+    dep = await db.fetchval("INSERT INTO deposits(user_id,method,amount,credit) VALUES($1,'upi',$2,$2) RETURNING id", m.from_user.id, inr)
     await state.set_state(S.upi_proof)
     await state.update_data(dep=dep, inr=str(inr))
     await m.answer(f"🇮🇳 Deposit #{dep}\nPay {money(inr)} to UPI ID:\n<code>{gs('upi_id')}</code>\n\n"
@@ -806,30 +758,17 @@ async def upi_proof(m: Message, state: FSMContext):
     for a in ADMINS:
         try:
             await m.copy_to(a)
-            await bot.send_message(a, f"UPI deposit #{d['dep']}\nUser: {m.from_user.id}\nAmount: {money(d['inr'])}", reply_markup=kb)
+            await bot.send_message(a, f"UPI deposit #{d['dep']}\nUser: {m.from_user.id}\nAmount: ₹{d['inr']}", reply_markup=kb)
         except Exception:
             pass
     await m.answer("⏳ Sent for verification. Balance will be added once approved.")
-
-@r.callback_query(F.data.startswith("ad:"))
-async def admin_cb(cb: CallbackQuery):
-    if cb.from_user.id not in ADMINS: return await cb.answer()
-    _, act, i = cb.data.split(":")
-    if act == "ok":
-        txt = "✅ Approved" if await credit_deposit(int(i)) else "Already processed"
-    else:
-        uid = await db.fetchval("UPDATE deposits SET status='rejected' WHERE id=$1 AND status='pending' RETURNING user_id", int(i))
-        if uid: await tell(uid, f"❌ Deposit #{i} was rejected. Contact support.")
-        txt = "❌ Rejected" if uid else "Already processed"
-    await cb.message.edit_text(f"{cb.message.text}\n\n{txt}")
-    await cb.answer()
 
 
 # ======================= background jobs =======================
 async def rpc(url, method, params):
     async with HTTP.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-                         timeout=aiohttp.ClientTimeout(total=25)) as resp:
-        j = await resp.json(content_type=None)
+                         timeout=aiohttp.ClientTimeout(total=25)) as r:
+        j = await r.json(content_type=None)
     if "error" in j: raise RuntimeError(j["error"])
     return j["result"]
 
@@ -838,7 +777,7 @@ async def match(key, val, txid, get_ts):
     for p in await db.fetch("SELECT id, amount, created FROM deposits WHERE method=$1 AND status='pending'", key):
         if p["amount"] != q: continue
         if await db.fetchval("SELECT 1 FROM deposits WHERE txid=$1", txid): return
-        if await get_ts() < p["created"].timestamp() - 60: return  # payment older than the deposit request
+        if await get_ts() < p["created"].timestamp() - 60: return
         await credit_deposit(p["id"], txid)
         return
 
@@ -850,8 +789,7 @@ async def block_ts(c, bn):
 
 async def scan_tron(key, c):
     url = f"https://api.trongrid.io/v1/accounts/{c['wallet']}/transactions/trc20?only_to=true&limit=50&contract_address={c['contract']}"
-    async with HTTP.get(url, headers={"TRON-PRO-API-KEY": TRON_KEY} if TRON_KEY else {},
-                        timeout=aiohttp.ClientTimeout(total=20)) as resp:
+    async with HTTP.get(url, headers={"TRON-PRO-API-KEY": TRON_KEY} if TRON_KEY else {}, timeout=aiohttp.ClientTimeout(total=20)) as resp:
         txs = (await resp.json(content_type=None)).get("data", [])
     for tx in txs:
         if tx.get("to") != c["wallet"]: continue
@@ -914,24 +852,23 @@ async def status_loop():
 async def main():
     global db, HTTP
     logging.basicConfig(level=logging.INFO)
-    db = await asyncpg.create_pool(DB_URL, min_size=2, max_size=10)
-    HTTP = aiohttp.ClientSession()
+    logging.info("Admins: %s", ADMINS)
+    db = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
     await db.execute(SCHEMA)
     await seed()
-    await wipe_once()
     await load_settings()
-    await load_catalog()
     await load_banned()
+    await load_catalog()
+    HTTP = aiohttp.ClientSession()
     dp = Dispatcher()
     dp.update.outer_middleware(BanMW())
     dp.include_routers(adm, r)
-    tasks = [asyncio.create_task(crypto_poller()), asyncio.create_task(status_loop())]
+    asyncio.create_task(crypto_poller())
+    asyncio.create_task(status_loop())
     try:
         await dp.start_polling(bot)
     finally:
-        for t in tasks: t.cancel()
         await HTTP.close()
-        await db.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
